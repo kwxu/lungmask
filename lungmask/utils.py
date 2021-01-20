@@ -10,6 +10,12 @@ import logging
 from tqdm import tqdm
 import fill_voids
 import skimage.morphology
+import os
+import errno
+import math
+import shutil
+import logging
+import sys
 
 
 def preprocess(img, label=None, resolution=[192, 192]):
@@ -34,6 +40,15 @@ def preprocess(img, label=None, resolution=[192, 192]):
         return np.asarray(cip_xnew), cip_box
     else:
         return np.asarray(cip_xnew), cip_box, np.asarray(cip_mask)
+
+
+def get_input_image(path):
+    if os.path.isfile(path):
+        logging.info(f'Read input: {path}')
+        input_image = sitk.ReadImage(path)
+    else:
+        raise NotImplementedError
+    return input_image
 
 
 def simple_bodymask(img):
@@ -99,96 +114,6 @@ class LungLabelsDS_inf(Dataset):
 
     def __getitem__(self, idx):
         return self.dataset[idx, None, :, :].astype(np.float)
-
-
-def read_dicoms(path, primary=True, original=True):
-    allfnames = []
-    for dir, _, fnames in os.walk(path):
-        [allfnames.append(os.path.join(dir, fname)) for fname in fnames]
-
-    dcm_header_info = []
-    dcm_parameters = []
-    unique_set = []  # need this because too often there are duplicates of dicom files with different names
-    i = 0
-    for fname in tqdm(allfnames):
-        filename_ = os.path.splitext(os.path.split(fname)[1])
-        i += 1
-        if filename_[0] != 'DICOMDIR':
-            try:
-                dicom_header = pyd.dcmread(fname, defer_size=100, stop_before_pixels=True, force=True)
-                if dicom_header is not None:
-                    if 'ImageType' in dicom_header:
-                        if primary:
-                            is_primary = all([x in dicom_header.ImageType for x in ['PRIMARY']])
-                        else:
-                            is_primary = True
-
-                        if original:
-                            is_original = all([x in dicom_header.ImageType for x in ['ORIGINAL']])
-                        else:
-                            is_original = True
-
-                        # if 'ConvolutionKernel' in dicom_header:
-                        #     ck = dicom_header.ConvolutionKernel
-                        # else:
-                        #     ck = 'unknown'
-                        if is_primary and is_original and 'LOCALIZER' not in dicom_header.ImageType:
-                            h_info_wo_name = [dicom_header.StudyInstanceUID, dicom_header.SeriesInstanceUID,
-                                              dicom_header.ImagePositionPatient]
-                            h_info = [dicom_header.StudyInstanceUID, dicom_header.SeriesInstanceUID, fname,
-                                      dicom_header.ImagePositionPatient]
-                            if h_info_wo_name not in unique_set:
-                                unique_set.append(h_info_wo_name)
-                                dcm_header_info.append(h_info)
-                                # kvp = None
-                                # if 'KVP' in dicom_header:
-                                #     kvp = dicom_header.KVP
-                                # dcm_parameters.append([ck, kvp,dicom_header.SliceThickness])
-            except:
-                logging.error("Unexpected error:", sys.exc_info()[0])
-                logging.warning("Doesn't seem to be DICOM, will be skipped: ", fname)
-
-    conc = [x[1] for x in dcm_header_info]
-    sidx = np.argsort(conc)
-    conc = np.asarray(conc)[sidx]
-    dcm_header_info = np.asarray(dcm_header_info)[sidx]
-    # dcm_parameters = np.asarray(dcm_parameters)[sidx]
-    vol_unique = np.unique(conc, return_index=1, return_inverse=1)  # unique volumes
-    n_vol = len(vol_unique[1])
-    logging.info('There are ' + str(n_vol) + ' volumes in the study')
-
-    relevant_series = []
-    relevant_volumes = []
-
-    for i in range(len(vol_unique[1])):
-        curr_vol = i
-        info_idxs = np.where(vol_unique[2] == curr_vol)[0]
-        vol_files = dcm_header_info[info_idxs, 2]
-        positions = np.asarray([np.asarray(x[2]) for x in dcm_header_info[info_idxs, 3]])
-        slicesort_idx = np.argsort(positions)
-        vol_files = vol_files[slicesort_idx]
-        relevant_series.append(vol_files)
-        reader = sitk.ImageSeriesReader()
-        reader.SetFileNames(vol_files)
-        vol = reader.Execute()
-        relevant_volumes.append(vol)
-
-    return relevant_volumes
-
-
-def get_input_image(path):
-    if os.path.isfile(path):
-        logging.info(f'Read input: {path}')
-        input_image = sitk.ReadImage(path)
-    else:
-        logging.info(f'Looking for dicoms in {path}')
-        dicom_vols = read_dicoms(path, original=False, primary=False)
-        if len(dicom_vols) < 1:
-            sys.exit('No dicoms found!')
-        if len(dicom_vols) > 1:
-            logging.warning("There are more than one volume in the path, will take the largest one")
-        input_image = dicom_vols[np.argmax([np.prod(v.GetSize()) for v in dicom_vols], axis=0)]
-    return input_image
 
 
 def postrocessing(label_image, spare=[]):
@@ -277,3 +202,396 @@ def keep_largest_connected_component(mask):
     max_region = np.argsort(resizes)[-1] + 1
     mask = mask == max_region
     return mask
+
+
+def convert_3d_2_flat(in_data_matrix):
+    num_voxel = np.prod(in_data_matrix.shape)
+    return in_data_matrix.reshape(num_voxel)
+
+
+def convert_flat_2_3d(in_data_array, im_shape):
+    return in_data_array.reshape(im_shape)
+
+
+def read_file_contents_list(file_name):
+    print(f'Reading from file list txt {file_name}', flush=True)
+    with open(file_name) as file:
+        lines = [line.rstrip('\n') for line in file]
+        print(f'Number items: {len(lines)}')
+        return lines
+
+def save_file_contents_list(file_name, item_list):
+    print(f'Save list to file {file_name}')
+    print(f'Number items: {len(item_list)}')
+    with open(file_name, 'w') as file:
+        for item in item_list:
+            file.write(item + '\n')
+
+
+def get_dice(img1, img2):
+    assert img1.shape == img2.shape
+
+    img1 = img1.flatten().astype(float)
+    img2 = img2.flatten().astype(float)
+
+    dice_val = 2 * (img1 * img2).sum() / (img1 + img2).sum()
+
+    return dice_val
+
+def get_dice_with_effective_mask(img1, img2, mask):
+    assert img1.shape == img2.shape
+    assert img1.shape == mask.shape
+
+    mask = mask.flatten().astype(float)
+    img1 = img1.flatten().astype(float)
+    img2 = img2.flatten().astype(float)
+
+    img1 = img1 * mask
+    img2 = img2 * mask
+
+    dice_val = 2 * (img1 * img2).sum() / (img1 + img2).sum()
+
+    return dice_val
+
+
+def get_range_paral_chunk(total_num_item, chunk_pair):
+    num_item_each_chunk = int(math.ceil(float(total_num_item) / float(chunk_pair[1])))
+    range_lower = num_item_each_chunk * (chunk_pair[0] - 1)
+    # range_upper = num_item_each_chunk * chunk_pair[0] - 1
+    range_upper = num_item_each_chunk * chunk_pair[0]
+    if range_upper > total_num_item:
+        range_upper = total_num_item
+
+    return [range_lower, range_upper]
+
+
+def get_current_chunk(in_list, chunk_pair):
+    chunks_list = get_chunks_list(in_list, chunk_pair[1])
+    current_chunk = chunks_list[chunk_pair[0] - 1]
+    return current_chunk
+
+
+def get_chunks_list(in_list, num_chunks):
+    return [in_list[i::num_chunks] for i in range(num_chunks)]
+
+
+def get_nii_filepath_and_filename_list(dataset_root):
+    nii_file_path_list = []
+    subject_list = os.listdir(dataset_root)
+    for i in range(len(subject_list)):
+        subj = subject_list[i]
+        subj_path = dataset_root + '/' + subj
+        sess_list = os.listdir(subj_path)
+        for sess in sess_list:
+            sess_path = subj_path + '/' + sess
+            nii_files = os.listdir(sess_path)
+            for nii_file in nii_files:
+                nii_file_path = sess_path + '/' + nii_file
+                nii_file_path_list.append(nii_file_path)
+                # nii_file_name_list.append(nii_file)
+
+
+    return nii_file_path_list
+
+
+def get_nii_filepath_and_filename_list_flat(dataset_root):
+    nii_file_path_list = []
+    nii_file_name_list = os.listdir(dataset_root)
+    for file_name in nii_file_name_list:
+        nii_file_path = os.path.join(dataset_root, file_name)
+        nii_file_path_list.append(nii_file_path)
+
+    return nii_file_path_list
+
+
+def get_nii_filepath_and_filename_list_hierarchy(dataset_root):
+    nii_file_path_list = []
+    nii_file_name_list = []
+    subject_list = os.listdir(dataset_root)
+    for i in range(len(subject_list)):
+        subj = subject_list[i]
+        subj_path = dataset_root + '/' + subj
+        sess_list = os.listdir(subj_path)
+        for sess in sess_list:
+            sess_path = subj_path + '/' + sess
+            nii_files = os.listdir(sess_path)
+            for nii_file in nii_files:
+                nii_file_path = sess_path + '/' + nii_file
+                nii_file_path_list.append(nii_file_path)
+                nii_file_name_list.append(nii_file)
+
+    return nii_file_path_list
+
+
+def get_dataset_path_list(dataset_root, dataset_type):
+    file_path_list = []
+    if dataset_type == 'flat':
+        file_path_list = get_nii_filepath_and_filename_list_flat(dataset_root)
+    elif dataset_type == 'hierarchy':
+        file_path_list = get_nii_filepath_and_filename_list(dataset_root)
+    else:
+        file_path_list = []
+
+    return file_path_list
+
+
+def resample_spore_nifti(spore_nifti_root, spore_resample_root):
+    """
+    Resample spore data, using c3d
+    :param spore_nifti_root:
+    :param spore_resample_root:
+    :return:
+    """
+    spore_nii_file_path_list = []
+    spore_nii_file_name_list = []
+    subject_list = os.listdir(spore_nifti_root)
+    for i in range(len(subject_list)):
+        subj = subject_list[i]
+        subj_path = spore_nifti_root + '/' + subj
+        sess_list = os.listdir(subj_path)
+        for sess in sess_list:
+            sess_path = subj_path + '/' + sess
+            nii_files = os.listdir(sess_path)
+            for nii_file in nii_files:
+                nii_file_path = sess_path + '/' + nii_file
+                spore_nii_file_path_list.append(nii_file_path)
+                spore_nii_file_name_list.append(nii_file)
+
+    file_count = 1
+    for iFile in range(len(spore_nii_file_path_list)):
+        # if file_count > 3:
+        #     break
+
+        file_path = spore_nii_file_path_list[iFile]
+        file_name = spore_nii_file_name_list[iFile]
+
+        output_path = spore_resample_root + '/' + file_name
+
+        print('Read image: ', file_path)
+
+        # command_read_info_str = 'c3d ' + file_path + ' -info-full'
+        # os.system(command_read_info_str)
+
+        command_str = 'c3d ' + file_path + ' -resample 256x256x180 -o ' + output_path
+
+        os.system(command_str)
+
+        print('Output file: ', file_name, " {}/{}".format(iFile, len(spore_nii_file_name_list)))
+        # command_image_info_str = 'c3d ' + output_path + ' -info-full'
+        #
+        # os.system(command_image_info_str)
+
+        file_count = file_count + 1
+
+
+def mkdir_p(path):
+    try:
+        os.makedirs(path)
+    except OSError as exc:  # Python >2.5
+        if exc.errno == errno.EEXIST and os.path.isdir(path):
+            pass
+        else:
+            raise
+
+
+def get_image_name_from_path(image_path):
+    return os.path.basename(image_path)
+
+
+def dataset_hierarchy_to_flat(in_folder, out_folder):
+    file_path_list = get_nii_filepath_and_filename_list(in_folder)
+    for file_idx in range(len(file_path_list)):
+        file_path = file_path_list[file_idx]
+        print(f'({file_idx}/{len(file_path_list)}), Process image {file_path}.')
+        file_name = get_image_name_from_path(file_path)
+        out_path = os.path.join(out_folder, file_name)
+        if os.path.exists(out_path):
+            print(out_path + ' already exist')
+        else:
+            print('Copy file %s to %s' % (file_path, out_path))
+            shutil.copyfile(file_path, out_path)
+
+
+def get_extension(file_full_path):
+    filename, file_extension = os.path.splitext(file_full_path)
+    return file_extension
+
+
+def get_registration_command_non_rigid(registration_method_name,
+                                       reg_args_affine,
+                                       reg_args_non_rigid,
+                                       label_file,
+                                       reg_tool_root,
+                                       fixed_image,
+                                       moving_image,
+                                       output_image,
+                                       output_mat,
+                                       output_trans,
+                                       output_affine):
+    command_list = []
+    actual_output_mat_path = output_mat + '_matrix.txt'
+
+    reg_args = reg_args_non_rigid
+
+    if registration_method_name == 'deformable_deedsBCV':
+        linearBCVslow_path = os.path.join(reg_tool_root, 'linearBCVslow')
+        deedsBCVslow_path = os.path.join(reg_tool_root, 'deedsBCVslow')
+        label_prop_command = ''
+        if label_file != '':
+            label_prop_command = f'-S {label_file}'
+        command_list.append(f'{linearBCVslow_path} -F {fixed_image} -M {moving_image} -O {output_mat}')
+        command_list.append(f'{deedsBCVslow_path} {reg_args} -F {fixed_image} -M {moving_image} -O {output_image} -A {actual_output_mat_path} {label_prop_command}')
+    elif registration_method_name == 'deformable_deedsBCV_paral':
+        linearBCV_path = os.path.join(reg_tool_root, 'linearBCV')
+        deedsBCV_path = os.path.join(reg_tool_root, 'deedsBCV')
+
+        label_prop_command = ''
+        if label_file != '':
+            label_prop_command = f'-S {label_file}'
+
+        command_list.append(f'{linearBCV_path} -F {fixed_image} -M {moving_image} -O {output_mat}')
+        command_list.append(f'{deedsBCV_path} {reg_args} -F {fixed_image} -M {moving_image} -O {output_image} -A {actual_output_mat_path} {label_prop_command}')
+    elif registration_method_name == 'deformable_niftyreg':
+        reg_aladin_path = os.path.join(reg_tool_root, 'reg_aladin')
+        reg_f3d_path = os.path.join(reg_tool_root, 'reg_f3d')
+
+        output_mat_real = output_mat.replace('.nii.gz', '.txt')
+        output_affine_im = output_affine
+        output_non_rigid_trans = output_trans
+
+        command_list.append(
+            f'{reg_aladin_path} {reg_args_affine} -ref {fixed_image} -flo {moving_image} -res {output_affine_im} -aff {output_mat_real}'
+        )
+
+        # command_list.append(
+        #     f'{reg_f3d_path} -voff {reg_args} -maxit 1000 -sx 10 -ref {fixed_image} -flo {moving_image} -aff {output_mat_real} -cpp {output_non_rigid_trans} -res {output_image}'
+        # )
+
+        command_list.append(
+            f'{reg_f3d_path} {reg_args_non_rigid} -maxit 1000 -ref {fixed_image} -flo {moving_image} -aff {output_mat_real} -cpp {output_non_rigid_trans} -res {output_image}'
+        )
+
+    else:
+        command_list.append('TODO')
+
+    return command_list
+
+
+def get_registration_command(registration_method_name, reg_args, label_file, reg_tool_root, fixed_image, moving_image, output_image, output_mat):
+
+    command_list = []
+    actual_output_mat_path = output_mat + '_matrix.txt'
+
+    if registration_method_name == 'affine_flirt':
+        flirt_path = os.path.join(reg_tool_root, 'flirt')
+        command_str = f'{flirt_path} {reg_args} -dof 12 -in {moving_image} -ref {fixed_image} -out {output_image} -omat {output_mat} '
+        command_list.append(command_str)
+    elif registration_method_name == 'affine_flirt_zhoubing':
+        flirt_path = os.path.join(reg_tool_root, 'flirt')
+        # 1. Rigid.
+        mid_step_rigid_mat = output_mat + "_rigid.txt"
+        mid_step_rigid_im = output_mat + "_rigid.nii.gz"
+        command_list.append(f'{flirt_path} -v -dof 6 -in {moving_image} -ref {fixed_image} -omat {mid_step_rigid_mat} -out {mid_step_rigid_im} -nosearch')
+        # 2. DOF 9 Affine.
+        command_list.append(f'{flirt_path} -v -dof 9 -in {moving_image} -ref {fixed_image} -init {mid_step_rigid_mat} -omat {output_mat} -out {output_image} -nosearch')
+    elif registration_method_name == 'affine_nifty_reg':
+        reg_aladin_path = os.path.join(reg_tool_root, 'reg_aladin')
+        output_mat_real = output_mat.replace('.nii.gz', '.txt')
+        command_list.append(f'{reg_aladin_path} -ln 5 -ref {fixed_image} -flo {moving_image} -res {output_image} -aff {output_mat_real}')
+    elif registration_method_name == 'affine_nifty_reg_mask':
+        reg_aladin_path = os.path.join(reg_tool_root, 'reg_aladin')
+        output_mat_real = output_mat.replace('.nii.gz', '.txt')
+        fixed_image_mask = fixed_image.replace('.nii.gz', '_mask.nii.gz')
+        moving_image_mask = moving_image.replace('.nii.gz', '_mask.nii.gz')
+        command_list.append(f'{reg_aladin_path} -ln 5 -ref {fixed_image} -rmask {fixed_image_mask} -flo {moving_image} -fmask {moving_image_mask} -res {output_image} -aff {output_mat_real}')
+    elif registration_method_name == 'rigid_nifty_reg':
+        reg_aladin_path = os.path.join(reg_tool_root, 'reg_aladin')
+        output_mat_real = output_mat.replace('.nii.gz', '.txt')
+        command_list.append(
+            f'{reg_aladin_path} -rigOnly -ln 5 -ref {fixed_image} -flo {moving_image} -res {output_image} -aff {output_mat_real}')
+    elif registration_method_name == 'affine_deedsBCV':
+        linearBCVslow_path = os.path.join(reg_tool_root, 'linearBCVslow')
+        applyLinearBCVfloat_path = os.path.join(reg_tool_root, 'applyLinearBCVfloat')
+        command_list.append(f'{linearBCVslow_path} -F {fixed_image} -M {moving_image} -O {output_mat}')
+        command_list.append(f'{applyLinearBCVfloat_path} -M {moving_image} -A {actual_output_mat_path} -D {output_image}')
+    elif registration_method_name == 'deformable_deedsBCV':
+        linearBCVslow_path = os.path.join(reg_tool_root, 'linearBCVslow')
+        deedsBCVslow_path = os.path.join(reg_tool_root, 'deedsBCVslow')
+
+        label_prop_command = ''
+        if label_file != '':
+            label_prop_command = f'-S {label_file}'
+
+        command_list.append(f'{linearBCVslow_path} -F {fixed_image} -M {moving_image} -O {output_mat}')
+        command_list.append(f'{deedsBCVslow_path} {reg_args} -F {fixed_image} -M {moving_image} -O {output_image} -A {actual_output_mat_path} {label_prop_command}')
+    elif registration_method_name == 'deformable_deedsBCV_paral':
+        linearBCV_path = os.path.join(reg_tool_root, 'linearBCV')
+        deedsBCV_path = os.path.join(reg_tool_root, 'deedsBCV')
+
+        label_prop_command = ''
+        if label_file != '':
+            label_prop_command = f'-S {label_file}'
+
+        command_list.append(f'{linearBCV_path} -F {fixed_image} -M {moving_image} -O {output_mat}')
+        command_list.append(f'{deedsBCV_path} {reg_args} -F {fixed_image} -M {moving_image} -O {output_image} -A {actual_output_mat_path} {label_prop_command}')
+    elif registration_method_name == 'deformable_niftyreg':
+        reg_aladin_path = os.path.join(reg_tool_root, 'reg_aladin')
+        reg_f3d_path = os.path.join(reg_tool_root, 'reg_f3d')
+
+        output_mat_real = output_mat.replace('.nii.gz', '.txt')
+        output_affine_im = output_image.replace('.nii.gz', '_affine.nii.gz')
+        output_non_rigid_trans = output_image.replace('.nii.gz', '_non_rigid_trans.nii.gz')
+
+        command_list.append(
+            f'{reg_aladin_path} -ln 5 -omp 32 -ref {fixed_image} -flo {moving_image} -res {output_affine_im} -aff {output_mat_real}'
+        )
+
+        command_list.append(
+            f'{reg_f3d_path} -ln 5 -omp 32 -maxit 1000 {reg_args} -ref {fixed_image} -flo {moving_image} -aff {output_mat_real} -cpp {output_non_rigid_trans} -res {output_image}'
+        )
+
+    else:
+        command_list.append('TODO')
+
+    return command_list
+
+
+def get_interpolation_command(interp_type_name, bash_config, src_root, moving_image):
+
+    command_list = []
+    file_name = moving_image
+    real_mat_name = file_name.replace('nii.gz', 'txt')
+
+    bash_script_path = ''
+    if interp_type_name == 'clipped_ori':
+        bash_script_path = os.path.join(src_root, 'tools/interp_clipped_roi.sh')
+    elif interp_type_name == 'full_ori':
+        bash_script_path = os.path.join(src_root, 'tools/interp_full_ori.sh')
+    elif interp_type_name == 'roi_lung_mask':
+        bash_script_path = os.path.join(src_root, 'tools/interp_ori_lung_mask.sh')
+
+    command_list.append(f'{bash_script_path} {bash_config} {file_name} {real_mat_name}')
+
+    return command_list
+
+
+loggers = {}
+
+
+def get_logger(name, level=logging.INFO):
+    global loggers
+    if loggers.get(name) is not None:
+        return loggers[name]
+    else:
+        logger = logging.getLogger(name)
+        logger.setLevel(level)
+        # Logging to console
+        stream_handler = logging.StreamHandler(sys.stdout)
+        formatter = logging.Formatter(
+            '%(asctime)s [%(threadName)s] %(levelname)s %(name)s - %(message)s')
+        stream_handler.setFormatter(formatter)
+        logger.addHandler(stream_handler)
+
+        loggers[name] = logger
+
+        return logger
